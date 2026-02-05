@@ -14,6 +14,89 @@ interface FileTreeNode extends GitHubFile {
   children?: FileTreeNode[];
 }
 
+// Helper to get GitHub headers with authentication
+function getGitHubHeaders(): HeadersInit {
+  const headers: HeadersInit = {
+    Accept: "application/vnd.github.v3+json",
+  };
+  
+  // Try multiple env var names for GitHub token
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT;
+  
+  if (token) {
+    // Support both "token" and "Bearer" formats
+    headers["Authorization"] = token.startsWith("ghp_") || token.startsWith("github_pat_") 
+      ? `token ${token}` 
+      : `Bearer ${token}`;
+  }
+  
+  return headers;
+}
+
+// Helper to handle rate limiting with exponential backoff
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries: number = 3
+): Promise<Response> {
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const response = await fetch(url, options);
+    
+    if (response.ok) {
+      return response;
+    }
+    
+    // Check rate limit headers
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    const resetTime = response.headers.get("x-ratelimit-reset");
+    
+    if (response.status === 403 && remaining === "0") {
+      const resetDate = resetTime ? new Date(parseInt(resetTime) * 1000) : null;
+      const waitTime = resetDate ? Math.max(0, resetDate.getTime() - Date.now()) : 60000;
+      
+      // If we have a token and still hit limits, or wait time is too long, throw immediately
+      const hasToken = options.headers && (options.headers as Record<string, string>)["Authorization"];
+      if (!hasToken) {
+        throw new Error(
+          `GitHub API rate limit exceeded. Add a GITHUB_TOKEN environment variable to increase limits. ` +
+          `Reset at: ${resetDate?.toISOString() || "unknown"}`
+        );
+      }
+      
+      // If wait time is reasonable (< 5 seconds), wait and retry
+      if (waitTime < 5000 && attempt < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, waitTime + 1000));
+        continue;
+      }
+      
+      throw new Error(
+        `GitHub API rate limit exceeded even with authentication. ` +
+        `Reset at: ${resetDate?.toISOString() || "unknown"}`
+      );
+    }
+    
+    if (response.status === 404) {
+      throw new Error("Repository not found");
+    }
+    
+    if (response.status === 401) {
+      throw new Error("Invalid GitHub token. Please check your GITHUB_TOKEN environment variable.");
+    }
+    
+    // For other errors, retry with backoff
+    if (attempt < maxRetries - 1 && response.status >= 500) {
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+      continue;
+    }
+    
+    lastError = new Error(`GitHub API error: ${response.status}`);
+  }
+  
+  throw lastError || new Error("Failed to fetch from GitHub API");
+}
+
 async function fetchGitHubTree(
   owner: string,
   repo: string,
@@ -23,23 +106,9 @@ async function fetchGitHubTree(
     // GitHub API endpoint for getting contents
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
 
-    const response = await fetch(url, {
-      headers: {
-        Accept: "application/vnd.github.v3+json",
-        // Add token if available for higher rate limits
-        ...(process.env.GITHUB_TOKEN && { Authorization: `token ${process.env.GITHUB_TOKEN}` }),
-      },
+    const response = await fetchWithRetry(url, {
+      headers: getGitHubHeaders(),
     });
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        throw new Error("Repository not found");
-      }
-      if (response.status === 403) {
-        throw new Error("Rate limit exceeded. Please try again later.");
-      }
-      throw new Error(`GitHub API error: ${response.status}`);
-    }
 
     const data = await response.json();
 
@@ -138,5 +207,5 @@ async function getKeyFiles(owner: string, repo: string): Promise<string[]> {
   }
 }
 
-export { fetchGitHubTree, buildFileTree, getKeyFiles };
+export { fetchGitHubTree, buildFileTree, getKeyFiles, getGitHubHeaders, fetchWithRetry };
 export type { FileTreeNode, GitHubFile };

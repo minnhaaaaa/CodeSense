@@ -1,3 +1,5 @@
+"use client"
+
 import { RepoSearchBar } from "@/components/RepoSearchBar"
 import { RepoCard } from "@/components/RepoCard"
 import { BookOpen, Zap, Code2, Sparkles } from "lucide-react"

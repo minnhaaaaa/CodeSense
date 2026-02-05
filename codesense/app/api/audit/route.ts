@@ -1,38 +1,19 @@
-/**
- * POST /api/audit
- * 
- * Agentic PR Suggestor API Route
- * 
- * This route:
- * 1. Accepts repo and owner parameters
- * 2. Uses DeepWiki analysis to get code insights
- * 3. Sends insights to Gemini for structured analysis
- * 4. Returns structured JSON with PR title, body, and file changes
- */
-
-import { analyzeRepositoryWithDeepWiki } from "@/app/core/mcp/deepwikiClient";
-import { buildFileTree } from "@/lib/github";
-import { fetchCodeContext, guessSourceFiles } from "@/lib/githubFiles";
-import { GeminiKeyManager } from "@/lib/geminiKeyManager";
 import { z } from "zod";
+import { GeminiKeyManager } from "@/lib/geminiKeyManager";
 
-// Request body schema
+export const maxDuration = 60;
+
+// Request schema
 const requestSchema = z.object({
-  owner: z.string().min(1, "Owner is required"),
-  repo: z.string().min(1, "Repo is required"),
+  owner: z.string().min(1),
+  repo: z.string().min(1),
   autoCreatePr: z.boolean().optional().default(false),
 });
 
-// Schema for the structured PR suggestion output
+// Response schema for Gemini
 const prSuggestionSchema = z.object({
   prTitle: z.string(),
   prBody: z.string(),
-  fileChanges: z.array(z.object({
-    path: z.string(),
-    action: z.enum(["create", "update", "delete"]),
-    content: z.string().nullable(),
-    reason: z.string(),
-  })),
   summary: z.string(),
   issuesFound: z.object({
     codeQuality: z.array(z.string()),
@@ -40,196 +21,233 @@ const prSuggestionSchema = z.object({
     redundancy: z.array(z.string()),
     formatting: z.array(z.string()),
   }),
+  fileChanges: z.array(z.object({
+    path: z.string(),
+    action: z.enum(["create", "update", "delete"]),
+    content: z.string().nullable(),
+    reason: z.string(),
+  })),
 });
 
-type PrSuggestion = z.infer<typeof prSuggestionSchema>;
+// DeepWiki MCP JSON-RPC call
+async function callDeepWikiMcp(toolName: string, args: Record<string, string>): Promise<string> {
+  const requestId = `req-${Date.now()}`;
+  
+  const response = await fetch("https://mcp.deepwiki.com/mcp", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "tools/call",
+      params: {
+        name: toolName,
+        arguments: args,
+      },
+    }),
+  });
 
-export async function POST(request: Request) {
-  try {
-    // Parse and validate request body
-    const body = await request.json();
-    const validationResult = requestSchema.safeParse(body);
+  if (!response.ok) {
+    throw new Error(`DeepWiki MCP error: ${response.status}`);
+  }
 
-    if (!validationResult.success) {
-      return Response.json(
-        { 
-          error: "Invalid request body", 
-          details: validationResult.error.flatten() 
-        },
-        { status: 400 }
-      );
-    }
+  const data = await response.json();
+  
+  if (data.error) {
+    throw new Error(`DeepWiki MCP error: ${data.error.message || JSON.stringify(data.error)}`);
+  }
 
-    const { owner, repo } = validationResult.data;
-    const repoUrl = `https://github.com/${owner}/${repo}`;
+  // Extract text content from the response
+  const content = data.result?.content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c: { type: string }) => c.type === "text")
+      .map((c: { text: string }) => c.text)
+      .join("\n");
+  }
+  
+  return typeof content === "string" ? content : JSON.stringify(content);
+}
 
-    // Step 1: Get DeepWiki analysis
-    console.log(`[Audit] Analyzing repository ${owner}/${repo}...`);
-    
-    const deepWikiAnalysis = await analyzeRepositoryWithDeepWiki(repoUrl);
+// Get repository insights from DeepWiki
+async function getDeepWikiInsights(owner: string, repo: string): Promise<{
+  structure: string;
+  overview: string;
+  codeQuality: string;
+}> {
+  const repoName = `${owner}/${repo}`;
+  
+  console.log("[v0] Fetching DeepWiki insights for:", repoName);
+  
+  // Fetch insights in parallel
+  const [structureResult, overviewResult, codeQualityResult] = await Promise.allSettled([
+    callDeepWikiMcp("read_wiki_structure", { repo_name: repoName }),
+    callDeepWikiMcp("read_wiki_contents", { repo_name: repoName, topic: "Overview" }),
+    callDeepWikiMcp("ask_question", { 
+      repo_name: repoName, 
+      question: "What are the main code quality issues, potential security vulnerabilities, code duplication, and formatting inconsistencies in this repository? Be specific about file names and line numbers if possible."
+    }),
+  ]);
 
-    // Step 2: Fetch actual code context for better analysis
-    let codeContext = "";
-    let fileList: string[] = [];
-    
-    try {
-      const fileTree = await buildFileTree(owner, repo, "", 0, 2);
-      const filePaths = guessSourceFiles(fileTree, owner, repo);
-      const context = await fetchCodeContext(owner, repo, filePaths);
-      
-      fileList = Object.keys(context.fileContents);
-      codeContext = `\n\nFiles analyzed: ${fileList.join(", ")}\n`;
+  const structure = structureResult.status === "fulfilled" ? structureResult.value : "Unable to fetch structure";
+  const overview = overviewResult.status === "fulfilled" ? overviewResult.value : "Unable to fetch overview";
+  const codeQuality = codeQualityResult.status === "fulfilled" ? codeQualityResult.value : "Unable to analyze code quality";
 
-      // Include code snippets from multiple files for better context
-      const entries = Object.entries(context.fileContents).slice(0, 3);
-      for (const [filename, content] of entries) {
-        const snippet = content.substring(0, 800);
-        codeContext += `\n--- ${filename} ---\n\`\`\`\n${snippet}\n...\n\`\`\`\n`;
-      }
-    } catch (err) {
-      console.error("[Audit] Error fetching code context:", err);
-      // Continue without code context
-    }
+  console.log("[v0] DeepWiki insights fetched successfully");
+  
+  return { structure, overview, codeQuality };
+}
 
-    // Step 3: Build comprehensive prompt for Gemini
-    const analysisPrompt = `You are an expert code reviewer and security analyst. Analyze the following repository and provide structured suggestions for improving the codebase.
+// Call Gemini for analysis
+async function analyzeWithGemini(
+  owner: string,
+  repo: string,
+  deepWikiInsights: { structure: string; overview: string; codeQuality: string }
+): Promise<z.infer<typeof prSuggestionSchema>> {
+  
+  const prompt = `You are an expert code reviewer analyzing the GitHub repository "${owner}/${repo}".
 
-Repository: ${owner}/${repo}
-Repository URL: ${repoUrl}
+Based on the following DeepWiki analysis, provide a structured PR suggestion to improve the codebase.
 
-## Repository Analysis
-Summary: ${deepWikiAnalysis.summary}
+## Repository Structure
+${deepWikiInsights.structure.substring(0, 2000)}
 
-Key Findings:
-${deepWikiAnalysis.findings.map((f, i) => `${i + 1}. ${f}`).join("\n")}
+## Repository Overview  
+${deepWikiInsights.overview.substring(0, 2000)}
 
-${codeContext}
-
----
+## Code Quality Analysis
+${deepWikiInsights.codeQuality.substring(0, 3000)}
 
 Based on this analysis, provide a JSON response with the following structure:
 {
-  "prTitle": "A concise, descriptive title for a pull request that summarizes the main improvements",
-  "prBody": "Detailed description of all changes in Markdown format",
+  "prTitle": "A concise PR title describing the main improvements",
+  "prBody": "A detailed PR description in markdown format explaining all the changes",
+  "summary": "A 2-3 sentence summary of the main issues found and proposed fixes",
+  "issuesFound": {
+    "codeQuality": ["List of code quality issues found"],
+    "security": ["List of security issues found"],
+    "redundancy": ["List of code duplication/redundancy issues"],
+    "formatting": ["List of formatting/style issues"]
+  },
   "fileChanges": [
     {
       "path": "path/to/file.ts",
       "action": "update",
-      "content": "The suggested new content or null for deletions",
-      "reason": "Brief explanation of why this change is needed"
+      "content": "Brief description or code snippet of the change (can be null for complex changes)",
+      "reason": "Why this change is needed"
     }
-  ],
-  "summary": "Brief 1-2 sentence summary of the audit findings",
-  "issuesFound": {
-    "codeQuality": ["List of code quality issues found"],
-    "security": ["List of security issues found"],
-    "redundancy": ["List of redundancy/duplication issues found"],
-    "formatting": ["List of formatting issues found"]
+  ]
+}
+
+Focus on actionable, specific suggestions. If you don't find issues in a category, use an empty array.
+Return ONLY valid JSON, no markdown code blocks.`;
+
+  console.log("[v0] Calling Gemini for analysis...");
+
+  const response = await GeminiKeyManager.callWithFallback(async (apiKey) => {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.7,
+          },
+        }),
+      }
+    );
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      console.error("[v0] Gemini API error:", res.status, errorText);
+      throw new Error(`Gemini HTTP error: ${res.status}`);
+    }
+
+    return res;
+  });
+
+  const json = await response.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!text) {
+    console.error("[v0] Gemini returned no content:", JSON.stringify(json));
+    throw new Error("Gemini returned no content");
+  }
+
+  console.log("[v0] Gemini response received, parsing...");
+
+  // Parse the JSON response
+  try {
+    // Clean the response - remove markdown code blocks if present
+    let cleanedText = text.trim();
+    if (cleanedText.startsWith("```json")) {
+      cleanedText = cleanedText.slice(7);
+    }
+    if (cleanedText.startsWith("```")) {
+      cleanedText = cleanedText.slice(3);
+    }
+    if (cleanedText.endsWith("```")) {
+      cleanedText = cleanedText.slice(0, -3);
+    }
+    cleanedText = cleanedText.trim();
+
+    const parsed = JSON.parse(cleanedText);
+    return prSuggestionSchema.parse(parsed);
+  } catch (parseError) {
+    console.error("[v0] Failed to parse Gemini response:", parseError);
+    console.error("[v0] Raw response:", text.substring(0, 500));
+    
+    // Return a fallback structure
+    return {
+      prTitle: `Code quality improvements for ${owner}/${repo}`,
+      prBody: `Based on automated analysis, this PR addresses various code quality issues.\n\n${text.substring(0, 1000)}`,
+      summary: "Automated code analysis completed. See details below.",
+      issuesFound: {
+        codeQuality: ["Analysis completed - see PR body for details"],
+        security: [],
+        redundancy: [],
+        formatting: [],
+      },
+      fileChanges: [],
+    };
   }
 }
 
-Focus on finding:
-- Code duplicacy and redundancy
-- Formatting and style consistency issues
-- Security vulnerabilities and unsafe patterns
-- Performance improvements
-- Best practices violations
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const { owner, repo } = requestSchema.parse(body);
 
-If no issues are found in a category, use an empty array.
-Only suggest concrete, actionable file changes that would meaningfully improve the codebase.
-Return ONLY valid JSON, no additional text.`;
+    console.log("[v0] Starting audit for:", owner, repo);
 
-    // Step 4: Call Gemini for structured analysis
-    console.log("[Audit] Generating suggestions with Gemini...");
+    // Step 1: Get DeepWiki insights
+    const deepWikiInsights = await getDeepWikiInsights(owner, repo);
 
-    const geminiResponse = await GeminiKeyManager.callWithFallback(async (apiKey) => {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: analysisPrompt }] }],
-            generationConfig: {
-              responseMimeType: "application/json",
-            },
-          }),
-        }
-      );
+    // Step 2: Analyze with Gemini
+    const analysis = await analyzeWithGemini(owner, repo, deepWikiInsights);
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`Gemini API error: ${res.status} - ${errorText}`);
-      }
+    console.log("[v0] Audit completed successfully");
 
-      return res;
+    return Response.json({
+      success: true,
+      analysis,
     });
 
-    const geminiJson = await geminiResponse.json() as {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{ text?: string }>;
-        };
-      }>;
-    };
-
-    const responseText = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
-    
-    if (!responseText) {
-      throw new Error("Gemini returned empty response");
-    }
-
-    // Step 5: Parse and validate the response
-    let prSuggestion: PrSuggestion;
-    
-    try {
-      // Clean the response text (remove markdown code blocks if present)
-      let cleanedText = responseText.trim();
-      if (cleanedText.startsWith("```json")) {
-        cleanedText = cleanedText.slice(7);
-      }
-      if (cleanedText.startsWith("```")) {
-        cleanedText = cleanedText.slice(3);
-      }
-      if (cleanedText.endsWith("```")) {
-        cleanedText = cleanedText.slice(0, -3);
-      }
-      cleanedText = cleanedText.trim();
-
-      const parsed = JSON.parse(cleanedText);
-      prSuggestion = prSuggestionSchema.parse(parsed);
-    } catch (parseError) {
-      console.error("[Audit] Failed to parse Gemini response:", parseError);
-      console.error("[Audit] Raw response:", responseText);
-      
-      // Provide a fallback response based on DeepWiki analysis
-      prSuggestion = {
-        prTitle: `Improve ${repo} based on code analysis`,
-        prBody: `## Summary\n\n${deepWikiAnalysis.summary}\n\n## Findings\n\n${deepWikiAnalysis.findings.map(f => `- ${f}`).join("\n")}`,
-        fileChanges: [],
-        summary: deepWikiAnalysis.summary,
-        issuesFound: {
-          codeQuality: deepWikiAnalysis.findings.slice(0, 2),
-          security: [],
-          redundancy: [],
-          formatting: [],
-        },
-      };
-    }
-
-    // Step 6: Return the response
-    const response = {
-      success: true,
-      analysis: prSuggestion,
-    };
-
-    return Response.json(response);
   } catch (error) {
-    console.error("[Audit] Unexpected error:", error);
+    console.error("[v0] Audit failed:", error);
     
-    const message = error instanceof Error ? error.message : "Unknown error";
+    const message = error instanceof Error ? error.message : "Unknown error occurred";
+    
     return Response.json(
-      { error: "Audit failed", details: message },
+      { 
+        success: false, 
+        error: message,
+      },
       { status: 500 }
     );
   }

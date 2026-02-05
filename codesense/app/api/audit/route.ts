@@ -5,40 +5,16 @@
  * 
  * This route:
  * 1. Accepts repo and owner parameters
- * 2. Calls DeepWiki MCP endpoint to get code insights
- * 3. Sends insights to Gemini 1.5 Flash for analysis
- * 4. Parses the response as structured JSON with PR title, body, and file changes
- * 5. Uses Octokit to create a branch and open a PR on GitHub
+ * 2. Uses DeepWiki analysis to get code insights
+ * 3. Sends insights to Gemini for structured analysis
+ * 4. Returns structured JSON with PR title, body, and file changes
  */
 
-import { generateText, Output } from "ai";
+import { analyzeRepositoryWithDeepWiki } from "@/app/core/mcp/deepwikiClient";
+import { buildFileTree } from "@/lib/github";
+import { fetchCodeContext, guessSourceFiles } from "@/lib/githubFiles";
+import { GeminiKeyManager } from "@/lib/geminiKeyManager";
 import { z } from "zod";
-import { getCodeInsights } from "@/lib/deepwikiMcp";
-import { createPrWithChanges, FileChange, PrResult } from "@/lib/githubPr";
-
-// Schema for file changes in the PR
-const fileChangeSchema = z.object({
-  path: z.string().describe("The file path relative to the repository root"),
-  action: z.enum(["create", "update", "delete"]).describe("The type of change to make"),
-  content: z.string().nullable().describe("The new content of the file (null for deletions)"),
-  reason: z.string().describe("Brief explanation of why this change is needed"),
-});
-
-// Schema for the structured PR suggestion output
-const prSuggestionSchema = z.object({
-  prTitle: z.string().describe("A concise, descriptive title for the pull request"),
-  prBody: z.string().describe("Detailed description of the changes, formatted in Markdown"),
-  fileChanges: z.array(fileChangeSchema).describe("List of file changes to make"),
-  summary: z.string().describe("Brief summary of the audit findings"),
-  issuesFound: z.object({
-    codeQuality: z.array(z.string()).describe("Code quality issues found"),
-    security: z.array(z.string()).describe("Security issues found"),
-    redundancy: z.array(z.string()).describe("Redundancy and duplication issues found"),
-    formatting: z.array(z.string()).describe("Formatting issues found"),
-  }),
-});
-
-type PrSuggestion = z.infer<typeof prSuggestionSchema>;
 
 // Request body schema
 const requestSchema = z.object({
@@ -46,6 +22,27 @@ const requestSchema = z.object({
   repo: z.string().min(1, "Repo is required"),
   autoCreatePr: z.boolean().optional().default(false),
 });
+
+// Schema for the structured PR suggestion output
+const prSuggestionSchema = z.object({
+  prTitle: z.string(),
+  prBody: z.string(),
+  fileChanges: z.array(z.object({
+    path: z.string(),
+    action: z.enum(["create", "update", "delete"]),
+    content: z.string().nullable(),
+    reason: z.string(),
+  })),
+  summary: z.string(),
+  issuesFound: z.object({
+    codeQuality: z.array(z.string()),
+    security: z.array(z.string()),
+    redundancy: z.array(z.string()),
+    formatting: z.array(z.string()),
+  }),
+});
+
+type PrSuggestion = z.infer<typeof prSuggestionSchema>;
 
 export async function POST(request: Request) {
   try {
@@ -63,124 +60,167 @@ export async function POST(request: Request) {
       );
     }
 
-    const { owner, repo, autoCreatePr } = validationResult.data;
+    const { owner, repo } = validationResult.data;
+    const repoUrl = `https://github.com/${owner}/${repo}`;
 
-    // Step 1: Get code insights from DeepWiki MCP
-    console.log(`[Audit] Fetching code insights for ${owner}/${repo}...`);
+    // Step 1: Get DeepWiki analysis
+    console.log(`[Audit] Analyzing repository ${owner}/${repo}...`);
     
-    let codeInsights;
+    const deepWikiAnalysis = await analyzeRepositoryWithDeepWiki(repoUrl);
+
+    // Step 2: Fetch actual code context for better analysis
+    let codeContext = "";
+    let fileList: string[] = [];
+    
     try {
-      codeInsights = await getCodeInsights(owner, repo);
-    } catch (error) {
-      console.error("[Audit] DeepWiki MCP error:", error);
-      // Provide fallback insights if DeepWiki fails
-      codeInsights = {
-        overview: `Repository: ${owner}/${repo}`,
-        codeQuality: "Unable to fetch detailed code quality analysis. Please ensure the repository is public and accessible.",
-        securityAnalysis: "Unable to perform security analysis. Manual review recommended.",
-        suggestions: "Consider running local linting and security tools for a comprehensive analysis.",
-      };
+      const fileTree = await buildFileTree(owner, repo, "", 0, 2);
+      const filePaths = guessSourceFiles(fileTree, owner, repo);
+      const context = await fetchCodeContext(owner, repo, filePaths);
+      
+      fileList = Object.keys(context.fileContents);
+      codeContext = `\n\nFiles analyzed: ${fileList.join(", ")}\n`;
+
+      // Include code snippets from multiple files for better context
+      const entries = Object.entries(context.fileContents).slice(0, 3);
+      for (const [filename, content] of entries) {
+        const snippet = content.substring(0, 800);
+        codeContext += `\n--- ${filename} ---\n\`\`\`\n${snippet}\n...\n\`\`\`\n`;
+      }
+    } catch (err) {
+      console.error("[Audit] Error fetching code context:", err);
+      // Continue without code context
     }
 
-    // Step 2: Send insights to Gemini for structured analysis
-    console.log("[Audit] Analyzing with Gemini...");
-
-    const analysisPrompt = `You are an expert code reviewer and security analyst. Analyze the following repository insights and provide detailed, actionable suggestions for improving the codebase.
+    // Step 3: Build comprehensive prompt for Gemini
+    const analysisPrompt = `You are an expert code reviewer and security analyst. Analyze the following repository and provide structured suggestions for improving the codebase.
 
 Repository: ${owner}/${repo}
+Repository URL: ${repoUrl}
 
-## Repository Overview
-${codeInsights.overview}
+## Repository Analysis
+Summary: ${deepWikiAnalysis.summary}
 
-## Code Quality Analysis
-${codeInsights.codeQuality}
+Key Findings:
+${deepWikiAnalysis.findings.map((f, i) => `${i + 1}. ${f}`).join("\n")}
 
-## Security Analysis
-${codeInsights.securityAnalysis}
-
-## Improvement Suggestions
-${codeInsights.suggestions}
+${codeContext}
 
 ---
 
-Based on this analysis, provide:
-1. A clear, descriptive PR title that summarizes the main improvements
-2. A detailed PR body in Markdown format explaining all the changes
-3. Specific file changes with the actual code modifications needed
-4. A categorized list of all issues found (code quality, security, redundancy, formatting)
+Based on this analysis, provide a JSON response with the following structure:
+{
+  "prTitle": "A concise, descriptive title for a pull request that summarizes the main improvements",
+  "prBody": "Detailed description of all changes in Markdown format",
+  "fileChanges": [
+    {
+      "path": "path/to/file.ts",
+      "action": "update",
+      "content": "The suggested new content or null for deletions",
+      "reason": "Brief explanation of why this change is needed"
+    }
+  ],
+  "summary": "Brief 1-2 sentence summary of the audit findings",
+  "issuesFound": {
+    "codeQuality": ["List of code quality issues found"],
+    "security": ["List of security issues found"],
+    "redundancy": ["List of redundancy/duplication issues found"],
+    "formatting": ["List of formatting issues found"]
+  }
+}
 
-Focus on:
+Focus on finding:
 - Code duplicacy and redundancy
-- Formatting and style consistency
+- Formatting and style consistency issues
 - Security vulnerabilities and unsafe patterns
 - Performance improvements
-- Best practices and maintainability
+- Best practices violations
 
-For file changes, provide complete, working code that can be directly committed. Only suggest changes that will meaningfully improve the codebase.`;
+If no issues are found in a category, use an empty array.
+Only suggest concrete, actionable file changes that would meaningfully improve the codebase.
+Return ONLY valid JSON, no additional text.`;
 
-    const { output } = await generateText({
-      model: "google/gemini-1.5-flash",
-      output: Output.object({
-        schema: prSuggestionSchema,
-      }),
-      prompt: analysisPrompt,
+    // Step 4: Call Gemini for structured analysis
+    console.log("[Audit] Generating suggestions with Gemini...");
+
+    const geminiResponse = await GeminiKeyManager.callWithFallback(async (apiKey) => {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: analysisPrompt }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+            },
+          }),
+        }
+      );
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Gemini API error: ${res.status} - ${errorText}`);
+      }
+
+      return res;
     });
 
-    if (!output) {
-      return Response.json(
-        { error: "Failed to generate PR suggestions" },
-        { status: 500 }
-      );
+    const geminiJson = await geminiResponse.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string }>;
+        };
+      }>;
+    };
+
+    const responseText = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!responseText) {
+      throw new Error("Gemini returned empty response");
     }
 
-    const prSuggestion: PrSuggestion = output;
-
-    // Step 3: Optionally create the PR on GitHub
-    let prResult: PrResult | null = null;
-
-    if (autoCreatePr && prSuggestion.fileChanges.length > 0) {
-      console.log("[Audit] Creating PR on GitHub...");
-      
-      try {
-        // Convert file changes to the format expected by githubPr
-        const fileChanges: FileChange[] = prSuggestion.fileChanges.map((change) => ({
-          path: change.path,
-          action: change.action,
-          content: change.content || undefined,
-        }));
-
-        prResult = await createPrWithChanges(
-          owner,
-          repo,
-          fileChanges,
-          prSuggestion.prTitle,
-          prSuggestion.prBody
-        );
-
-        console.log(`[Audit] PR created: ${prResult.prUrl}`);
-      } catch (error) {
-        console.error("[Audit] Failed to create PR:", error);
-        // Continue without PR creation, return the suggestions
+    // Step 5: Parse and validate the response
+    let prSuggestion: PrSuggestion;
+    
+    try {
+      // Clean the response text (remove markdown code blocks if present)
+      let cleanedText = responseText.trim();
+      if (cleanedText.startsWith("```json")) {
+        cleanedText = cleanedText.slice(7);
       }
+      if (cleanedText.startsWith("```")) {
+        cleanedText = cleanedText.slice(3);
+      }
+      if (cleanedText.endsWith("```")) {
+        cleanedText = cleanedText.slice(0, -3);
+      }
+      cleanedText = cleanedText.trim();
+
+      const parsed = JSON.parse(cleanedText);
+      prSuggestion = prSuggestionSchema.parse(parsed);
+    } catch (parseError) {
+      console.error("[Audit] Failed to parse Gemini response:", parseError);
+      console.error("[Audit] Raw response:", responseText);
+      
+      // Provide a fallback response based on DeepWiki analysis
+      prSuggestion = {
+        prTitle: `Improve ${repo} based on code analysis`,
+        prBody: `## Summary\n\n${deepWikiAnalysis.summary}\n\n## Findings\n\n${deepWikiAnalysis.findings.map(f => `- ${f}`).join("\n")}`,
+        fileChanges: [],
+        summary: deepWikiAnalysis.summary,
+        issuesFound: {
+          codeQuality: deepWikiAnalysis.findings.slice(0, 2),
+          security: [],
+          redundancy: [],
+          formatting: [],
+        },
+      };
     }
 
-    // Step 4: Return the response
+    // Step 6: Return the response
     const response = {
       success: true,
-      analysis: {
-        prTitle: prSuggestion.prTitle,
-        prBody: prSuggestion.prBody,
-        fileChanges: prSuggestion.fileChanges,
-        summary: prSuggestion.summary,
-        issuesFound: prSuggestion.issuesFound,
-      },
-      ...(prResult && {
-        pr: {
-          url: prResult.prUrl,
-          number: prResult.prNumber,
-          branch: prResult.branchName,
-        },
-      }),
+      analysis: prSuggestion,
     };
 
     return Response.json(response);

@@ -215,7 +215,8 @@ export default function RepoPage() {
   useEffect(() => {
     fetchAnalysis()
     fetchFileStructure()
-  }, [fetchAnalysis, fetchFileStructure])
+    fetchDiagram("architecture")
+  }, [fetchAnalysis, fetchFileStructure, fetchDiagram])
 
   // Fetch suggestions when tab is switched to suggestions and data not loaded
   useEffect(() => {
@@ -385,7 +386,8 @@ export default function RepoPage() {
         )}
 
         {activeTab === "overview" && (state.status === "streaming" || state.status === "complete") && (
-          <div className="max-w-3xl mx-auto">
+          <div className="max-w-5xl mx-auto space-y-6">
+            {/* Analysis Card */}
             <div className="prose prose-invert max-w-none">
               <div className="rounded-xl border border-border bg-card p-6 md:p-8">
                 <h2 className="text-xl font-semibold text-foreground mb-4 flex items-center gap-2">
@@ -398,6 +400,68 @@ export default function RepoPage() {
                     <span className="inline-block w-2 h-5 bg-primary ml-1 animate-pulse" />
                   )}
                 </div>
+              </div>
+            </div>
+
+            {/* Two Column Layout for Structure and Diagram */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* File Structure */}
+              <div className="rounded-xl border border-border bg-card p-6">
+                <h2 className="text-lg font-semibold text-foreground mb-4 flex items-center gap-2">
+                  <FolderTree className="w-5 h-5" />
+                  Repository Structure
+                </h2>
+                {loadingFiles ? (
+                  <div className="flex items-center justify-center py-12">
+                    <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                  </div>
+                ) : fileTree.length > 0 ? (
+                  <div className="max-h-[400px] overflow-y-auto">
+                    <FileStructure tree={fileTree} />
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground text-center py-8">No files found</p>
+                )}
+              </div>
+
+              {/* Architecture Diagram */}
+              <div className="rounded-xl border border-border bg-card p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
+                    <GitBranch className="w-5 h-5" />
+                    Architecture
+                  </h2>
+                  <div className="flex gap-1">
+                    {(["architecture", "flowchart", "dependency"] as const).map((type) => (
+                      <Button
+                        key={type}
+                        variant={diagramType === type ? "default" : "ghost"}
+                        size="sm"
+                        onClick={() => fetchDiagram(type)}
+                        disabled={loadingDiagram}
+                        className="text-xs px-2 py-1 h-7"
+                      >
+                        {type === "architecture" ? "Arch" : type === "flowchart" ? "Flow" : "Deps"}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+                {loadingDiagram ? (
+                  <div className="flex items-center justify-center py-12">
+                    <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                  </div>
+                ) : diagram ? (
+                  <div className="max-h-[400px] overflow-auto">
+                    <MermaidDiagram diagramCode={diagram} title="" />
+                  </div>
+                ) : (
+                  <div className="text-center py-12">
+                    <p className="text-muted-foreground mb-4 text-sm">No diagram generated yet</p>
+                    <Button onClick={() => fetchDiagram()} variant="outline" size="sm">
+                      Generate Diagram
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
           </div>

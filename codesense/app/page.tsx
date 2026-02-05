@@ -128,7 +128,11 @@ export default function HomePage() {
             </p>
 
             {/* Rainbow CTA Button */}
-            <RainbowButton>
+            <RainbowButton
+              onClick={() => {
+                document.getElementById("explore-repos")?.scrollIntoView({ behavior: "smooth" })
+              }}
+            >
               <Sparkles className="w-4 h-4" />
               Explore Repositories
             </RainbowButton>
@@ -172,7 +176,7 @@ export default function HomePage() {
       </section>
 
       {/* Featured Repos */}
-      <section className="py-16 border-t border-border relative z-10">
+      <section id="explore-repos" className="py-16 border-t border-border relative z-10 scroll-mt-20">
         <div className="container mx-auto px-4">
           <div className="text-center mb-12">
             <h2 className="text-2xl md:text-3xl font-bold text-foreground mb-4">

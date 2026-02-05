@@ -5,7 +5,7 @@ import { useParams } from "next/navigation"
 import { useState, useEffect, useCallback } from "react"
 import Link from "next/link"
 import Image from "next/image"
-import { ArrowLeft, BookOpen, FolderTree, MessageSquare, Loader2, ExternalLink, RefreshCw, GitBranch } from "lucide-react"
+import { ArrowLeft, BookOpen, FolderTree, MessageSquare, Loader2, ExternalLink, RefreshCw, GitBranch, Lightbulb, AlertTriangle, FileCode, Shield, Code2, CheckCircle2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { RepoSearchBar } from "@/components/RepoSearchBar"
@@ -23,6 +23,32 @@ interface FileTreeNode {
   type: "file" | "dir"
   path: string
   children?: FileTreeNode[]
+}
+
+interface FileChange {
+  path: string
+  action: "create" | "update" | "delete"
+  content: string | null
+  reason: string
+}
+
+interface IssuesFound {
+  codeQuality: string[]
+  security: string[]
+  redundancy: string[]
+  formatting: string[]
+}
+
+interface SuggestionsState {
+  status: "idle" | "loading" | "complete" | "error"
+  data: {
+    prTitle: string
+    prBody: string
+    fileChanges: FileChange[]
+    summary: string
+    issuesFound: IssuesFound
+  } | null
+  error: string | null
 }
 
 export default function RepoPage() {
@@ -44,10 +70,17 @@ export default function RepoPage() {
   const [loadingDiagram, setLoadingDiagram] = useState(false)
   const [diagramType, setDiagramType] = useState<"architecture" | "flowchart" | "dependency">("architecture")
 
-  const [activeTab, setActiveTab] = useState<"overview" | "structure" | "diagram" | "ask">("overview")
+  const [activeTab, setActiveTab] = useState<"overview" | "suggestions" | "ask">("overview")
   const [question, setQuestion] = useState("")
   const [isAskingQuestion, setIsAskingQuestion] = useState(false)
   const [questionAnswer, setQuestionAnswer] = useState("")
+  
+  const [suggestions, setSuggestions] = useState<SuggestionsState>({
+    status: "idle",
+    data: null,
+    error: null,
+  })
+  const [expandedFileChange, setExpandedFileChange] = useState<number | null>(null)
 
   const fetchAnalysis = useCallback(async () => {
     if (!owner || !name) return
@@ -140,10 +173,56 @@ export default function RepoPage() {
     }
   }, [owner, name, diagramType])
 
+  const fetchSuggestions = useCallback(async () => {
+    if (!owner || !name) return
+    if (suggestions.status === "loading") return
+
+    setSuggestions({ status: "loading", data: null, error: null })
+
+    try {
+      const res = await fetch("/api/audit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner, repo: name, autoCreatePr: false }),
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}))
+        throw new Error(errorData.error || "Failed to fetch suggestions")
+      }
+
+      const data = await res.json()
+      
+      if (data.success && data.analysis) {
+        setSuggestions({
+          status: "complete",
+          data: data.analysis,
+          error: null,
+        })
+      } else {
+        throw new Error("Invalid response format")
+      }
+    } catch (error) {
+      console.error("Error fetching suggestions:", error)
+      setSuggestions({
+        status: "error",
+        data: null,
+        error: error instanceof Error ? error.message : "Failed to fetch suggestions",
+      })
+    }
+  }, [owner, name, suggestions.status])
+
   useEffect(() => {
     fetchAnalysis()
     fetchFileStructure()
   }, [fetchAnalysis, fetchFileStructure])
+
+  // Fetch suggestions when tab is switched to suggestions and data not loaded
+  useEffect(() => {
+    if (activeTab === "suggestions" && suggestions.status === "idle") {
+      fetchSuggestions()
+    }
+  }, [activeTab, suggestions.status, fetchSuggestions])
 
   const handleAskQuestion = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -259,8 +338,7 @@ export default function RepoPage() {
           <nav className="flex gap-1 overflow-x-auto">
             {[
               { id: "overview", label: "Overview", icon: BookOpen },
-              { id: "structure", label: "Files", icon: FolderTree },
-              { id: "diagram", label: "Architecture", icon: GitBranch },
+              { id: "suggestions", label: "Suggestions", icon: Lightbulb },
               { id: "ask", label: "Ask", icon: MessageSquare },
             ].map(({ id, label, icon: Icon }) => (
               <button
@@ -325,57 +403,259 @@ export default function RepoPage() {
           </div>
         )}
 
-        {activeTab === "structure" && (
-          <div className="max-w-4xl mx-auto">
-            <div className="rounded-xl border border-border bg-card p-6 md:p-8">
-              <h2 className="text-xl font-semibold text-foreground mb-4 flex items-center gap-2">
-                <FolderTree className="w-5 h-5" />
-                Repository Files
-              </h2>
-              {loadingFiles ? (
-                <div className="flex items-center justify-center py-12">
-                  <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        {activeTab === "suggestions" && (
+          <div className="max-w-4xl mx-auto space-y-6">
+            {suggestions.status === "loading" && (
+              <div className="rounded-xl border border-border bg-card p-8">
+                <div className="flex flex-col items-center justify-center py-12">
+                  <Loader2 className="w-8 h-8 animate-spin text-muted-foreground mb-4" />
+                  <p className="text-muted-foreground text-center">
+                    Analyzing repository with DeepWiki and Gemini AI...
+                  </p>
+                  <p className="text-sm text-muted-foreground/60 mt-2">
+                    This may take a minute for larger repositories
+                  </p>
                 </div>
-              ) : fileTree.length > 0 ? (
-                <FileStructure tree={fileTree} />
-              ) : (
-                <p className="text-muted-foreground text-center py-8">No files found</p>
-              )}
-            </div>
-          </div>
-        )}
+              </div>
+            )}
 
-        {activeTab === "diagram" && (
-          <div className="max-w-4xl mx-auto space-y-4">
-            <div className="flex gap-2">
-              {(["architecture", "flowchart", "dependency"] as const).map((type) => (
-                <Button
-                  key={type}
-                  variant={diagramType === type ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => fetchDiagram(type)}
-                  disabled={loadingDiagram}
-                >
-                  {type.charAt(0).toUpperCase() + type.slice(1)}
-                </Button>
-              ))}
-            </div>
-            <div className="rounded-xl border border-border bg-card p-6">
-              {loadingDiagram ? (
-                <div className="flex items-center justify-center py-12">
-                  <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+            {suggestions.status === "error" && (
+              <div className="rounded-xl border border-destructive/50 bg-destructive/10 p-6">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="w-5 h-5 text-destructive mt-0.5" />
+                  <div>
+                    <h3 className="font-semibold text-destructive mb-1">Analysis Failed</h3>
+                    <p className="text-sm text-destructive/80 mb-4">{suggestions.error}</p>
+                    <Button onClick={fetchSuggestions} variant="outline" size="sm">
+                      Try Again
+                    </Button>
+                  </div>
                 </div>
-              ) : diagram ? (
-                <MermaidDiagram diagramCode={diagram} title={`${diagramType.charAt(0).toUpperCase() + diagramType.slice(1)} Diagram`} />
-              ) : (
-                <div className="text-center py-12">
-                  <p className="text-muted-foreground mb-4">No diagram generated yet</p>
-                  <Button onClick={() => fetchDiagram()} variant="outline">
-                    Generate Diagram
+              </div>
+            )}
+
+            {suggestions.status === "complete" && suggestions.data && (
+              <>
+                {/* Summary Card */}
+                <div className="rounded-xl border border-border bg-card p-6">
+                  <div className="flex items-start gap-3 mb-4">
+                    <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
+                    <div>
+                      <h2 className="text-lg font-semibold text-foreground">
+                        {suggestions.data.prTitle}
+                      </h2>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        {suggestions.data.summary}
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    onClick={fetchSuggestions}
+                    variant="outline"
+                    size="sm"
+                    className="mt-2"
+                  >
+                    <RefreshCw className="w-4 h-4 mr-2" />
+                    Re-analyze
                   </Button>
                 </div>
-              )}
-            </div>
+
+                {/* Issues Found Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Code Quality */}
+                  {suggestions.data.issuesFound.codeQuality.length > 0 && (
+                    <div className="rounded-xl border border-border bg-card p-5">
+                      <div className="flex items-center gap-2 mb-3">
+                        <Code2 className="w-4 h-4 text-blue-400" />
+                        <h3 className="font-medium text-foreground">Code Quality</h3>
+                        <span className="ml-auto text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full">
+                          {suggestions.data.issuesFound.codeQuality.length}
+                        </span>
+                      </div>
+                      <ul className="space-y-2">
+                        {suggestions.data.issuesFound.codeQuality.slice(0, 5).map((issue, idx) => (
+                          <li key={idx} className="text-sm text-muted-foreground flex items-start gap-2">
+                            <span className="text-blue-400 mt-1">-</span>
+                            {issue}
+                          </li>
+                        ))}
+                        {suggestions.data.issuesFound.codeQuality.length > 5 && (
+                          <li className="text-xs text-muted-foreground/60">
+                            +{suggestions.data.issuesFound.codeQuality.length - 5} more issues
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Security */}
+                  {suggestions.data.issuesFound.security.length > 0 && (
+                    <div className="rounded-xl border border-border bg-card p-5">
+                      <div className="flex items-center gap-2 mb-3">
+                        <Shield className="w-4 h-4 text-red-400" />
+                        <h3 className="font-medium text-foreground">Security</h3>
+                        <span className="ml-auto text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded-full">
+                          {suggestions.data.issuesFound.security.length}
+                        </span>
+                      </div>
+                      <ul className="space-y-2">
+                        {suggestions.data.issuesFound.security.slice(0, 5).map((issue, idx) => (
+                          <li key={idx} className="text-sm text-muted-foreground flex items-start gap-2">
+                            <span className="text-red-400 mt-1">-</span>
+                            {issue}
+                          </li>
+                        ))}
+                        {suggestions.data.issuesFound.security.length > 5 && (
+                          <li className="text-xs text-muted-foreground/60">
+                            +{suggestions.data.issuesFound.security.length - 5} more issues
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Redundancy */}
+                  {suggestions.data.issuesFound.redundancy.length > 0 && (
+                    <div className="rounded-xl border border-border bg-card p-5">
+                      <div className="flex items-center gap-2 mb-3">
+                        <FolderTree className="w-4 h-4 text-yellow-400" />
+                        <h3 className="font-medium text-foreground">Redundancy</h3>
+                        <span className="ml-auto text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded-full">
+                          {suggestions.data.issuesFound.redundancy.length}
+                        </span>
+                      </div>
+                      <ul className="space-y-2">
+                        {suggestions.data.issuesFound.redundancy.slice(0, 5).map((issue, idx) => (
+                          <li key={idx} className="text-sm text-muted-foreground flex items-start gap-2">
+                            <span className="text-yellow-400 mt-1">-</span>
+                            {issue}
+                          </li>
+                        ))}
+                        {suggestions.data.issuesFound.redundancy.length > 5 && (
+                          <li className="text-xs text-muted-foreground/60">
+                            +{suggestions.data.issuesFound.redundancy.length - 5} more issues
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Formatting */}
+                  {suggestions.data.issuesFound.formatting.length > 0 && (
+                    <div className="rounded-xl border border-border bg-card p-5">
+                      <div className="flex items-center gap-2 mb-3">
+                        <FileCode className="w-4 h-4 text-purple-400" />
+                        <h3 className="font-medium text-foreground">Formatting</h3>
+                        <span className="ml-auto text-xs bg-purple-500/20 text-purple-400 px-2 py-0.5 rounded-full">
+                          {suggestions.data.issuesFound.formatting.length}
+                        </span>
+                      </div>
+                      <ul className="space-y-2">
+                        {suggestions.data.issuesFound.formatting.slice(0, 5).map((issue, idx) => (
+                          <li key={idx} className="text-sm text-muted-foreground flex items-start gap-2">
+                            <span className="text-purple-400 mt-1">-</span>
+                            {issue}
+                          </li>
+                        ))}
+                        {suggestions.data.issuesFound.formatting.length > 5 && (
+                          <li className="text-xs text-muted-foreground/60">
+                            +{suggestions.data.issuesFound.formatting.length - 5} more issues
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                {/* File Changes */}
+                {suggestions.data.fileChanges.length > 0 && (
+                  <div className="rounded-xl border border-border bg-card p-6">
+                    <h3 className="font-semibold text-foreground mb-4 flex items-center gap-2">
+                      <FileCode className="w-5 h-5" />
+                      Suggested File Changes
+                      <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded-full ml-2">
+                        {suggestions.data.fileChanges.length} files
+                      </span>
+                    </h3>
+                    <div className="space-y-3">
+                      {suggestions.data.fileChanges.map((change, idx) => (
+                        <div
+                          key={idx}
+                          className="border border-border rounded-lg overflow-hidden"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setExpandedFileChange(expandedFileChange === idx ? null : idx)}
+                            className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors text-left"
+                          >
+                            <div className="flex items-center gap-3">
+                              <span
+                                className={cn(
+                                  "text-xs font-medium px-2 py-0.5 rounded",
+                                  change.action === "create" && "bg-green-500/20 text-green-400",
+                                  change.action === "update" && "bg-blue-500/20 text-blue-400",
+                                  change.action === "delete" && "bg-red-500/20 text-red-400"
+                                )}
+                              >
+                                {change.action}
+                              </span>
+                              <code className="text-sm text-foreground">{change.path}</code>
+                            </div>
+                            <span className="text-muted-foreground text-sm">
+                              {expandedFileChange === idx ? "Hide" : "Show"}
+                            </span>
+                          </button>
+                          {expandedFileChange === idx && (
+                            <div className="border-t border-border p-4 bg-muted/30">
+                              <p className="text-sm text-muted-foreground mb-3">
+                                {change.reason}
+                              </p>
+                              {change.content && (
+                                <pre className="text-xs bg-background p-3 rounded-lg overflow-x-auto border border-border">
+                                  <code>{change.content}</code>
+                                </pre>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* PR Body Preview */}
+                <div className="rounded-xl border border-border bg-card p-6">
+                  <h3 className="font-semibold text-foreground mb-4 flex items-center gap-2">
+                    <GitBranch className="w-5 h-5" />
+                    Pull Request Description
+                  </h3>
+                  <div className="prose prose-sm prose-invert max-w-none">
+                    <div className="text-sm text-muted-foreground whitespace-pre-wrap leading-relaxed">
+                      {suggestions.data.prBody}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {suggestions.status === "idle" && (
+              <div className="rounded-xl border border-border bg-card p-8">
+                <div className="flex flex-col items-center justify-center py-8">
+                  <Lightbulb className="w-12 h-12 text-muted-foreground/40 mb-4" />
+                  <h3 className="text-lg font-medium text-foreground mb-2">
+                    Get AI-Powered Suggestions
+                  </h3>
+                  <p className="text-sm text-muted-foreground text-center mb-6 max-w-md">
+                    Analyze this repository for code quality issues, security vulnerabilities, 
+                    redundancy, and formatting problems using DeepWiki and Gemini AI.
+                  </p>
+                  <Button onClick={fetchSuggestions}>
+                    <Lightbulb className="w-4 h-4 mr-2" />
+                    Generate Suggestions
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

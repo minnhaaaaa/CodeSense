@@ -58,6 +58,8 @@ export default function RepoPage() {
   const name = slug?.[1] || ""
   const repoPath = `${owner}/${name}`
 
+  console.log("[v0] RepoPage mounted - owner:", owner, "name:", name, "slug:", slug)
+
   const [state, setState] = useState<AnalysisState>({
     status: "idle",
     analysis: "",
@@ -83,7 +85,11 @@ export default function RepoPage() {
   const [expandedFileChange, setExpandedFileChange] = useState<number | null>(null)
 
   const fetchAnalysis = useCallback(async () => {
-    if (!owner || !name) return
+    console.log("[v0] fetchAnalysis called - owner:", owner, "name:", name)
+    if (!owner || !name) {
+      console.log("[v0] fetchAnalysis: missing owner or name, returning early")
+      return
+    }
 
     setState({ status: "loading", analysis: "", error: null })
 

@@ -57,6 +57,7 @@ async function analyzeWithGemini(
   // Check if we have any API keys
   if (
     !process.env.GEMINI_API_KEY &&
+    !process.env.GEMINI_API_KEY_BACKUP &&
     !process.env.GEMINI_API_KEY_BACKUP_1 &&
     !process.env.GEMINI_API_KEY_BACKUP_2
   ) {

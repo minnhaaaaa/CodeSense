@@ -6,6 +6,7 @@
 export class GeminiKeyManager {
   private static keys = [
     process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_BACKUP,
     process.env.GEMINI_API_KEY_BACKUP_1,
     process.env.GEMINI_API_KEY_BACKUP_2,
     process.env.GEMINI_API_KEY_BACKUP_3,

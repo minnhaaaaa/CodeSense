@@ -215,8 +215,15 @@ export default function RepoPage() {
   useEffect(() => {
     fetchAnalysis()
     fetchFileStructure()
-    fetchDiagram("architecture")
-  }, [fetchAnalysis, fetchFileStructure, fetchDiagram])
+  }, [fetchAnalysis, fetchFileStructure])
+  
+  // Separate effect for diagram to avoid infinite loop
+  useEffect(() => {
+    if (owner && name && !diagram && !loadingDiagram) {
+      fetchDiagram("architecture")
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [owner, name])
 
   // Fetch suggestions when tab is switched to suggestions and data not loaded
   useEffect(() => {
